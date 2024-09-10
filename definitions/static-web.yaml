@@ -1,0 +1,22 @@
+apiVersion: core.oam.dev/v1beta1
+kind: ComponentDefinition
+metadata:
+  annotations:
+    definition.oam.dev/description: Definition to create a bucket fronted by CDN. Can be used to host a static website.
+  labels:
+    type: terraform
+  name: aws-static-web-application-package
+  namespace: vela-system
+spec:
+  schematic:
+    terraform:
+      configuration: https://github.com/tuan-nguyenduc/template-static-web-application-package.git
+      providerRef:
+        name: aws
+        namespace: default
+      type: remote
+  workload:
+    definition:
+      apiVersion: terraform.core.oam.dev/v1beta1
+      kind: Configuration
+status: {}
