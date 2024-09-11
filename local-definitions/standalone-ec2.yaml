@@ -1,0 +1,321 @@
+apiVersion: core.oam.dev/v1beta1
+kind: ComponentDefinition
+metadata:
+  annotations:
+    definition.oam.dev/description: Terraform configuration for an EC2
+  creationTimestamp: null
+  labels:
+    type: terraform
+  name: aws-standalone-ec2
+  namespace: vela-system
+spec:
+  schematic:
+    terraform:
+      configuration: |
+        locals {
+          name                 = try("${var.environment}_${var.name}", var.name)
+          common_tags          = merge({ "Name" = local.name, "Environment" = var.environment }, var.tags)
+          compressed_user_data = try(base64gzip(var.user_data), null)
+          selected_user_data   = try(coalesce(var.user_data_base64, local.compressed_user_data), null) # NOTE: user_data_base64 overrides user_data
+        }
+
+        terraform {
+          required_providers {
+            aws = {
+              source  = "hashicorp/aws"
+              version = ">= 5.61.0"
+            }
+          }
+        }
+
+        resource "aws_key_pair" "pubkey" {
+          count = try(var.create_new_key, false) && try(var.pubkey, null) != null ? 1 : 0
+
+          key_name_prefix = "${local.name}_"
+          public_key      = var.pubkey
+          tags            = local.common_tags
+        }
+
+        resource "aws_instance" "this" {
+          ami                         = var.os == "Ubuntu" ? "ami-0497a974f8d5dcef8" : "ami-04a5ce820a419d6da"
+          instance_type               = var.instance_type
+          subnet_id                   = coalesce(var.subnet_id, data.aws_subnet.selected.id)
+          associate_public_ip_address = try(var.associate_public_ip, false)
+          key_name                    = var.create_new_key ? aws_key_pair.pubkey[0].key_name : try(var.key_pair_name, null)
+          monitoring                  = try(var.detailed_monitoring, false)
+          iam_instance_profile        = try(aws_iam_instance_profile.this[0].name, null)
+          user_data_base64            = local.selected_user_data
+          ebs_optimized               = true
+          root_block_device {
+            encrypted   = var.encrypt_volumes
+            kms_key_id  = var.ebs_key_id
+            iops        = var.root_volume_iops
+            throughput  = var.root_volume_throughput
+            volume_size = var.root_volume_size
+            volume_type = var.root_volume_type
+          }
+          dynamic "ebs_block_device" {
+            for_each = var.ebs_block_device
+            content {
+              encrypted   = var.encrypt_volumes
+              kms_key_id  = var.ebs_key_id
+              device_name = ebs_block_device.value.device_name
+              iops        = try(ebs_block_device.value.iops, null)
+              throughput  = try(ebs_block_device.value.throughput, null)
+              volume_size = try(ebs_block_device.value.volume_size, null)
+              volume_type = try(ebs_block_device.value.volume_type, null)
+            }
+          }
+          metadata_options {
+            http_tokens = "required"
+          }
+          volume_tags = merge(local.common_tags, var.volume_tags)
+          tags        = merge(local.common_tags, var.instance_tags)
+        }
+
+        resource "aws_ec2_instance_state" "state" {
+          instance_id = aws_instance.this.id
+          state       = var.instance_desired_state
+        }
+
+        resource "aws_eip_association" "this" {
+          count = try(var.eip_id, null) != null ? 1 : 0
+
+          instance_id   = aws_instance.this.id
+          allocation_id = var.eip_id
+        }
+
+        resource "aws_iam_instance_profile" "this" {
+          count = try(var.iam_role_name, null) != null ? 1 : 0
+
+          name_prefix = "${local.name}_"
+          role        = var.iam_role_name
+          tags        = local.common_tags
+        }
+
+        data "aws_subnet" "selected" {
+          filter {
+            name   = "tag:Name"
+            values = [var.subnet_name]
+          }
+        }
+
+        output "instance_id" {
+          value       = aws_instance.this.id
+          description = "Instance ID"
+        }
+
+        output "instance_state" {
+          value       = aws_ec2_instance_state.state.state
+          description = "State of the instance"
+        }
+
+        output "public_ip" {
+          value       = aws_instance.this.public_ip
+          description = "Public IP assigned to instance"
+        }
+
+        output "public_dns" {
+          value       = aws_instance.this.public_dns
+          description = "Public DNS name"
+        }
+
+        output "private_ip" {
+          value       = aws_instance.this.private_ip
+          description = "Private IP address"
+        }
+
+        output "private_dns" {
+          value       = aws_instance.this.private_dns
+          description = "Private DNS name"
+        }
+
+        output "ipv6_addrs" {
+          value       = aws_instance.this.ipv6_addresses
+          description = "IPv6 addresses assigned to instance"
+        }
+
+        output "key_pair_name" {
+          value       = try(aws_instance.this.key_name, null)
+          description = "Key name of login keypair"
+        }
+
+        output "root_volume_id" {
+          value       = one(aws_instance.this.root_block_device).volume_id
+          description = "Volume ID of root block device"
+        }
+
+        output "ebs_volume_ids" {
+          value       = { for v in aws_instance.this.ebs_block_device : v.device_name => v.volume_id }
+          description = "Map of device name to volume ID of additional EBS devices"
+        }
+
+        output "subnet_id" {
+          value       = aws_instance.this.id
+          description = "Subnet ID where the instance is created"
+        }
+
+        variable "name" {
+          description = "Name of instance"
+          type        = string
+        }
+
+        variable "environment" {
+          description = "Environment to deploy to (for tagging)"
+          type        = string
+          default     = null
+        }
+
+        variable "instance_type" {
+          description = "Instance type to launch"
+          type        = string
+        }
+
+        variable "os" {
+          description = "AMI ID for launching this instance"
+          type        = string
+        }
+
+        // Subnet ID: This variable is used to specify the ID of the subnet where the primary Elastic Network Interface (ENI) will be placed.
+        // If no subnet ID is provided, it will default to an empty string and the subnet will be selected based on the subnet name.
+        variable "subnet_id" {
+          description = "ID of subnet to place primary ENI in"
+          type        = string
+          default     = ""
+        }
+
+        // Subnet Name: This variable is used to specify the name of the subnet where the primary ENI will be placed.
+        // If no subnet name is provided, it will default to 'DefaultPublicSubnetCreatedByIDP'.
+        variable "subnet_name" {
+          description = "The name of the subnet"
+          type        = string
+          default     = "DefaultPublicSubnetCreatedByIDP"
+        }
+
+        variable "create_new_key" {
+          description = "Whether to create a new key pair"
+          type        = bool
+          default     = false
+        }
+
+        variable "key_pair_name" {
+          description = "Name of existing key pair to use"
+          type        = string
+          default     = null
+        }
+
+        variable "pubkey" {
+          description = "Public key for new key pair"
+          type        = string
+          default     = null
+        }
+
+        variable "associate_public_ip" {
+          description = "Whether to assign a public IP"
+          type        = bool
+          default     = false
+        }
+
+        variable "eip_id" {
+          description = "Allocation ID of Elastic IP to associate with"
+          type        = string
+          default     = null
+        }
+
+        variable "detailed_monitoring" {
+          description = "Enable detailed monitoring for the instance"
+          type        = bool
+          default     = false
+        }
+
+        variable "user_data" {
+          description = "User data in plain text; overridden by user_data_base64"
+          type        = string
+          default     = null
+        }
+
+        variable "user_data_base64" {
+          description = "User data in base64; overrides user_data"
+          type        = string
+          default     = ""
+        }
+
+        variable "iam_role_name" {
+          description = "Name of IAM Role to use as instance role"
+          type        = string
+          default     = null
+        }
+
+        variable "encrypt_volumes" {
+          description = "Whether to encrypt EBS volumes"
+          type        = bool
+          default     = true # CKV_AWS_8
+        }
+
+        variable "ebs_key_id" {
+          description = "ARN of KMS key to use for EBS encryption"
+          type        = string
+          default     = null
+        }
+
+        variable "root_volume_iops" {
+          description = "Provisioned IOPS for root volume (provisioned volume types only)"
+          type        = number
+          default     = null
+        }
+
+        variable "root_volume_throughput" {
+          description = "Provisioned throughput for root volume (provisioned volume types only)"
+          type        = number
+          default     = null
+        }
+
+        variable "root_volume_size" {
+          description = "Root volume size in GiB"
+          type        = number
+          default     = null
+        }
+
+        variable "root_volume_type" {
+          description = "Type of EBS volume for the root volume"
+          type        = string
+          default     = null
+        }
+
+        variable "ebs_block_device" {
+          description = "List of extra EBS volumes to attach (see ebs_block_device on aws_instance)"
+          type        = list(any)
+          default     = []
+        }
+
+        variable "tags" {
+          description = "Common tags to apply to each resource"
+          type        = map(string)
+          default     = {}
+        }
+
+        variable "volume_tags" {
+          description = "Tags to apply to EBS volumes"
+          type        = map(string)
+          default     = {}
+        }
+
+        variable "instance_tags" {
+          description = "Tags to apply to the instance"
+          type        = map(string)
+          default     = {}
+        }
+
+        variable "instance_desired_state" {
+          description = "The desired state of the instance"
+          type        = string
+          default     = "running"
+        }
+      providerRef:
+        name: aws
+        namespace: default
+  workload:
+    definition:
+      apiVersion: terraform.core.oam.dev/v1beta1
+      kind: Configuration
+status: {}
